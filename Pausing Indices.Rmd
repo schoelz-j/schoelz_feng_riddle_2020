@@ -1,0 +1,269 @@
+---
+title: "Pausing Indices and Metagene Profiles"
+output: html_notebook
+---
+
+This code calculates pausing indices from Next Generation Sequencing data and was used in Schoelz, Feng and Riddle (2020) "The Drosophila HP1 family is associated with active gene expression across chromatin contexts".
+
+Some functions in this code are modified from the following RPubs:
+https://rpubs.com/achitsaz/124545
+https://rpubs.com/achitsaz/94710
+
+# 1. Load required packages and functions:
+
+```{r}
+library(BiocManager)
+library(GenomicRanges)
+library(GenomicAlignments)
+library(rtracklayer)
+library(IRanges)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+scale_coverage <- function(x) {
+  # Scale a numeric vector down to size 1000
+  my_list = list()
+  for(i in seq(1, length(x), length(x)/1500)){
+    val <- mean(x[i:i+(length(x)/1500)], na.rm = T)
+    if(is.na(val)){
+      val <- 0
+    }
+    my_list[i] <- val
+  }
+  scaled_coverage <- unlist(my_list)
+  return(scaled_coverage)
+}
+rpmfun <- function(x) {
+  signif(x/nreads * 10^6, 3)
+}
+
+metagene <- function(file, file1, index, genes) {
+  ## Find Chromosome file gene is on
+  ch <- seqnames(genes[index])
+  
+  ## Get the coverage array at each basepair for the gene
+  view  <- Views(file[ch][[1]], ranges(genes[index]))
+  view.f1 <- Views(file1[ch][[1]], ranges(genes[index]))
+  
+  ## Change the class of the gene to numeric and then if the gene is in the reverse orientation,
+  ## reverse the orientation of the array
+  cov <- as.numeric(view[1][[1]])
+  if (as.logical(strand(genes[index]) == "-")) {
+    cov <- rev(cov)
+  }
+  ## Resize the coverage array of the gene down to length 1500
+  cov.mtx <- scale_coverage(cov)
+  
+  cov.f1 <- as.numeric(view.f1[1][[1]])
+  if (as.logical(strand(genes[index]) == "-")) {
+    cov.f1 <- rev(cov.f1)
+  }
+  cov.mtx.f1 <- scale_coverage(cov.f1)
+  
+  ## Get the average coverage for both replicates at each basepair 
+  overall.mean <- ceiling((cov.mtx + cov.mtx.f1)/2)
+  
+  ## Convert it into a matrix in an outputable way
+  cov.frame <- t(matrix(overall.mean))
+  
+  
+  ## have the rownames for each coverage matrix be the associated gene
+  row.names(cov.frame) <- names(genes[index])
+  
+  ## Return the coverage frame
+  return(cov.frame)
+}
+colstd <- function(x) {
+  sapply(1:4000, function(y) { sd(x[,y])})
+}
+ggplot_avg_gene1 <- function(y, z) {
+  ## Make a dataframe of the average coverage across all genes at each basepair
+  ## for gene1 and gene2
+  df <- data.frame(cbind(colMeans(y, na.rm = T), colMeans(z, na.rm = T)))
+  colnames(df) <- c("HP1", "No_HP1")
+  
+  ## Reshape the dataframe so it is 'ggplot'-able
+  df.gg <- df %>% gather(Expression, RPM, HP1:No_HP1)
+  df.gg$Index <- rep(1:1500)
+  
+  ## Add a column for standard error
+  df.gg$se <- c(colstd(y)/sqrt(nrow(y)), colstd(z)/sqrt(nrow(z)))
+  return(df.gg)
+          
+}
+pausing <- function(file, file1, index, genes) {
+  ## Find Chromosome file gene is on
+  ch <- seqnames(genes[index])
+  
+  ## Get the coverage array at each basepair for the gene
+  view  <- Views(file[ch][[1]], ranges(genes[index]))
+  view.f1 <- Views(file1[ch][[1]], ranges(genes[index]))
+  
+  ## Change the class of the gene to numeric and then if the gene is in the reverse orientation,
+  ## reverse the orientation of the array
+  cov <- as.numeric(view[1][[1]])
+  if (as.logical(strand(genes[index]) == "-")) {
+    cov <- rev(cov)
+  }
+  
+  ## Define region A data
+  regionA1 <- cov[1:500]
+  ## Define region B data
+  regionB1 <- cov[500:(500 + (length(cov)/4))]
+  
+  ## Calculate the pausing index in the first replicate 
+  PInd1 <- mean(regionA1) / mean(regionB1)
+  
+  
+  cov.f1 <- as.numeric(view.f1[1][[1]])
+  if (as.logical(strand(genes[index]) == "-")) {
+    cov.f1 <- rev(cov.f1)
+  }
+  regionA2 <- cov.f1[1:500]
+  regionB2 <- cov.f1[500:500+(length(cov)/4)]
+  PInd2 <- mean(regionA2) / mean(regionB2)
+  
+  
+  ## Get the average PInd
+  PInd <- (PInd1 + PInd2) / 2
+  pind.frame <- t(matrix(PInd))
+  row.names(pind.frame) <- names(genes[index])
+  return(pind.frame)
+}
+```
+
+# 2. Read in data and create sets of genes - filter out genes that are too small.
+
+```{r}
+y_variables <- c('Name', 'v1', 'FBgn', 'v2', 'oldchromosome', 'gstart', 'gstop', 'strand', 'HP1a',
+                  'HP1B', 'HP1C', 'Context')
+all_genes <- read.table('dmel_r6.25_genes_HP1_annotations_S2_contexts.csv',
+                        col.names = my_variables)
+all_genes <- all_genes %>%
+  mutate(chromosome = paste('chr', oldchromosome, sep = '')) %>%
+  filter(chromosome == 'chrX' | chromosome == 'chr2L' | chromosome == 'chr2R' | chromosome == 'chr3L' |
+           chromosome == 'chr3R' | chromosome == '4' | chromosome == 'Y') %>%
+  mutate(GeneLength = gstop - gstart) %>%
+  filter(GeneLength > 1000) %>%
+  mutate(start = gstart - 250) %>%
+  mutate(stop = gstop + 250)
+
+hp1a <- all_genes %>%
+  filter(HP1a == 1) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = T)
+no_hp1a <- all_genes %>%
+  filter(HP1a == 0) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = T)
+
+# Gene sets: HP1B bound vs unbound
+hp1b <- all_genes %>%
+  filter(HP1B == 1) %>%
+  makeGRangesFromDataFrame()
+no_hp1b <- all_genes %>%
+  filter(HP1B == 0) %>%
+  makeGRangesFromDataFrame()
+# Gene sets: HP1C bound vs unbound
+hp1c <- all_genes %>%
+  filter(HP1C == 1) %>%
+  makeGRangesFromDataFrame()
+no_hp1c <- all_genes %>%
+  filter(HP1C == 0) %>%
+  makeGRangesFromDataFrame()
+
+# Read in both replicates of the sequencing data.
+grobam08 <- BamFile('gro008.sorted.bam')
+aln1 <- readGAlignments(grobam08)
+aln1 <- as(aln1, 'GRanges')
+aln1 <- resize(aln1, 150)
+cov1 <- coverage(aln1)
+nreads <- length(aln1)
+gro_08_rpm <- lapply(cov1, rpmfun)
+gro_08_rpm <- as(gro_08_rpm, "SimpleRleList")
+
+grobam10 <- BamFile('gro010.sorted.bam')
+aln2 <- readGAlignments(grobam10)
+aln2 <- as(aln2, 'GRanges')
+aln2 <- resize(aln2, 150)
+cov2 <- coverage(aln2)
+nreads <- length(aln2)
+
+gro_10_rpm <- lapply(cov2, rpmfun)
+gro_10_rpm <- as(gro_10_rpm, "SimpleRleList")
+```
+
+# 3. Process datasets for the metagene function
+
+```{r}
+hp1a_list <- lapply(1:length(hp1a), metagene, file=gro_08_rpm, file1=gro_10_rpm, genes=hp1a)
+length(hp1a_list[[3]])
+hp1a_lis <- do.call(rbind, hp1a_list)
+
+no_hp1a_list <- lapply(1:length(no_hp1a), metagene, file=gro_08_rpm, file1=gro_10_rpm, genes=no_hp1a)
+no_hp1a_lis <- do.call(rbind, no_hp1a_list)
+
+hp1a_pre_df <- data.frame(cbind(colMeans(hp1a_lis, na.rm = T), colMeans(no_hp1a_lis, na.rm = T)))
+colnames(hp1a_pre_df) <- c("HP1a", "No_HP1a")
+str(hp1a_pre_df)
+hp1a.gg <- hp1a_pre_df %>% gather(Gene_Group, RPM, HP1a:No_HP1a)
+hp1a.gg$Position <- rep(1:1500)
+str(hp1a.gg)
+```
+
+# 4. Plot Metagene profiles
+
+```{r}
+hp1a_mg <- ggplot(hp1a.gg, aes(x=Position, y=RPM, Group=factor(Gene_Group)))+
+  geom_line(aes(colour=factor(Gene_Group)))+
+  scale_colour_manual(values=c("#473E92", "grey"))+
+  scale_x_continuous(breaks = c(250, 1250), labels = c("TSS", "TES"))+
+  theme_minimal()+
+  xlab('')+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = 'black'),
+        legend.position = 'none',
+        plot.title = element_text(face = "bold", hjust = 0.5))+
+  scale_y_continuous(expand = c(0,0))+
+  ggtitle('HP1a')+
+  geom_vline(xintercept = 250, colour = 'red', linetype = 'longdash')+
+  geom_vline(xintercept = 1250, colour = 'red', linetype = 'longdash')
+hp1a_mg
+
+```
+
+# 5. Pausing Indices
+
+This code runs through an example of calculating pausing indices for HP1a target and non-target genes with GRO-Seq data
+
+```{r}
+hp1a_pausing <- lapply(1:length(hp1a), pausing, file=gro_08_rpm, file1=gro_10_rpm, genes=hp1a)
+hp1a_p <- data.frame(unlist(hp1a_pausing))
+str(hp1a_p)
+hp1a_p2 <- hp1a_p < Inf
+mean(hp1a_p[hp1a_p2 == T], na.rm = T)
+nohp1a_pausing <- lapply(1:length(no_hp1a), pausing, file=gro_08_rpm, file1=gro_10_rpm, genes=no_hp1a)
+nohp1a_p <- data.frame(unlist(nohp1a_pausing))
+nohp1a_p2 <- nohp1a_p < Inf
+mean(nohp1a_p[nohp1a_p2 == T], na.rm = T)
+wilcox.test(hp1a_p[hp1a_p2 == T], nohp1a_p[nohp1a_p2 == T])
+colnames(hp1a_p) <- c('PInd')
+colnames(nohp1a_p) <- c('PInd')
+hp1a_p$HP1a <- c('HP1a')
+nohp1a_p$HP1a <- c('NoHP1a')
+hp1a_pausing <- data.frame(rbind(hp1a_p, nohp1a_p)) %>%
+  filter(PInd < Inf) %>%
+  mutate(LogPInd = log10(PInd))
+gro_hp1a <- ggplot(hp1a_pausing, aes(x = HP1a, y = LogPInd, fill = HP1a))+
+  geom_violin()+
+  scale_fill_manual(values = c('#473E92', 'grey'))+
+  theme_minimal()+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour= 'black'),
+        legend.position = 'none')+
+  scale_y_continuous(expand = c(0,0))+
+  xlab('')+
+  ylab('Log(10) Pausing Index')
+gro_hp1a
+```
